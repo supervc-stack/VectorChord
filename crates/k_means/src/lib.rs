@@ -12,6 +12,7 @@
 //
 // Copyright (c) 2025-2026 TensorChord Inc.
 
+mod emeans;
 mod flat;
 mod hierarchical;
 mod index;
@@ -19,6 +20,8 @@ mod quick;
 mod rabitq;
 
 pub mod square;
+
+pub use emeans::e_means;
 
 use crate::square::{Square, SquareMut};
 use rand::rngs::StdRng;

@@ -33,6 +33,31 @@ impl Default for VchordrqDefaultBuildOptions {
 pub enum KMeansAlgorithm {
     Lloyd {},
     Hierarchical {},
+    #[serde(rename = "e_means")]
+    EMeans(EMeansOptions),
+}
+
+impl Validate for KMeansAlgorithm {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        match self {
+            Self::EMeans(options) => options.validate(),
+            Self::Lloyd {} | Self::Hierarchical {} => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Validate)]
+#[serde(deny_unknown_fields)]
+pub struct EMeansOptions {
+    #[serde(default = "EMeansOptions::default_epochs")]
+    #[validate(range(min = 1, max = 1024))]
+    pub epochs: u32,
+}
+
+impl EMeansOptions {
+    fn default_epochs() -> u32 {
+        5
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Validate)]
@@ -53,6 +78,7 @@ pub struct VchordrqInternalBuildOptions {
     #[validate(range(min = 1, max = 255))]
     pub build_threads: u16,
     #[serde(default = "VchordrqInternalBuildOptions::default_kmeans_algorithm")]
+    #[validate(nested)]
     pub kmeans_algorithm: KMeansAlgorithm,
     #[serde(default = "VchordrqInternalBuildOptions::default_kmeans_dimension")]
     #[validate(range(min = 1, max = 16000))]
