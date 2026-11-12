@@ -17,3 +17,37 @@ $$);
 
 statement ok
 DROP TABLE t;
+
+statement ok
+CREATE TABLE e_means_t (id integer, val vector(3));
+
+statement ok
+INSERT INTO e_means_t SELECT i, ARRAY[i::real, 1, 0]::vector FROM generate_series(1, 20) AS i;
+
+statement error error while validating options
+CREATE INDEX ON e_means_t USING vchordrq (val vector_l2_ops)
+WITH (options = $$
+build.internal.lists = [3]
+build.internal.kmeans_algorithm.e_means = { epochs = 0 }
+$$);
+
+statement ok
+CREATE INDEX ON e_means_t USING vchordrq (val vector_l2_ops)
+WITH (options = $$
+build.internal.lists = [3]
+build.internal.kmeans_algorithm.e_means = { epochs = 2 }
+$$, probes = '3');
+
+statement ok
+SET enable_seqscan = off;
+
+query I
+SELECT id FROM e_means_t ORDER BY val <-> '[7,1,0]' LIMIT 1;
+----
+7
+
+statement ok
+RESET enable_seqscan;
+
+statement ok
+DROP TABLE e_means_t;

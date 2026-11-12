@@ -1277,6 +1277,13 @@ fn make_internal_build(
 ) -> Vec<Structure<Normalized>> {
     use humansize::{BINARY, format_size};
     use std::iter::once;
+    use std::time::Instant;
+
+    enum Trained<'a> {
+        Iterative(Box<dyn k_means::KMeans + 'a>),
+        EMeans(Square),
+    }
+
     let (reduction, sample_dim) = match internal_build.kmeans_dimension {
         None => (None, vector_options.dim as usize),
         Some(d) if d < vector_options.dim => (Some(d as usize), d as usize),
@@ -1370,74 +1377,93 @@ fn make_internal_build(
         let num_points = input.len();
         let num_dim = input.d();
         let num_lists = w as usize;
-        let num_iterations = internal_build.kmeans_iterations as _;
-        if result.is_empty() {
-            let percentage = 0;
-            let default = BuildPhase::from_code(BuildPhaseCode::InternalBuild);
-            let phase =
-                BuildPhase::new(BuildPhaseCode::InternalBuild, 1 + percentage).unwrap_or(default);
-            reporter.phase(phase);
-        }
-        if num_lists > 1 {
-            pgrx::info!(
-                "clustering: starting, clustering {num_points} vectors of {num_dim} dimension into {num_lists} clusters, in {num_iterations} iterations"
-            );
-        }
-        let mut f = 'f: {
-            let view = input.as_mut_view();
-            if result.last().is_some() {
-                break 'f k_means::lloyd_k_means(
-                    &pool,
-                    num_dim,
-                    view,
-                    num_lists,
-                    [7; 32],
-                    internal_build.spherical_centroids,
-                );
-            };
-            match internal_build.kmeans_algorithm {
-                KMeansAlgorithm::Lloyd {} => k_means::lloyd_k_means(
-                    &pool,
-                    num_dim,
-                    view,
-                    num_lists,
-                    [7; 32],
-                    internal_build.spherical_centroids,
-                ),
-                KMeansAlgorithm::Hierarchical {} => k_means::hierarchical_k_means(
-                    &pool,
-                    num_dim,
-                    view,
-                    num_lists,
-                    [7; 32],
-                    internal_build.spherical_centroids,
-                ),
-            }
-        };
-        for i in 0..num_iterations {
-            pgrx::check_for_interrupts!();
-            if result.is_empty() {
-                let percentage =
-                    ((i as f64 / num_iterations as f64) * 100.0).clamp(0.0, 100.0) as u16;
+        let num_iterations = internal_build.kmeans_iterations as usize;
+        let is_leaf = result.is_empty();
+        let report_progress = |step: usize, total: usize| {
+            if is_leaf {
+                let percentage = ((step as f64 / total as f64) * 100.0).clamp(0.0, 100.0) as u16;
                 let default = BuildPhase::from_code(BuildPhaseCode::InternalBuild);
                 let phase = BuildPhase::new(BuildPhaseCode::InternalBuild, 1 + percentage)
                     .unwrap_or(default);
                 reporter.phase(phase);
             }
-            if num_lists > 1 {
-                pgrx::info!("clustering: iteration {}", i + 1);
+        };
+        report_progress(0, 1);
+        let began = Instant::now();
+        let (trained, algorithm_name) = match &internal_build.kmeans_algorithm {
+            KMeansAlgorithm::EMeans(options) if is_leaf && num_points > num_lists => {
+                let epochs = options.epochs as usize;
+                pgrx::info!(
+                    "clustering: starting e-means on {num_points} vectors of {num_dim} dimension into {num_lists} clusters, in {epochs} epochs"
+                );
+                let mut reported_epoch = None;
+                let centroids = k_means::e_means(
+                    &pool,
+                    num_dim,
+                    input.as_mut_view(),
+                    num_lists,
+                    [7; 32],
+                    internal_build.spherical_centroids,
+                    epochs,
+                    |epoch| {
+                        pgrx::check_for_interrupts!();
+                        if reported_epoch != Some(epoch) {
+                            report_progress(epoch, epochs);
+                            pgrx::info!("clustering: e-means epoch {}", epoch + 1);
+                            reported_epoch = Some(epoch);
+                        }
+                    },
+                );
+                (Trained::EMeans(centroids), "e-means")
             }
-            f.assign();
-            f.update();
-        }
-        let centroids = 'centroids: {
-            if result.last().is_some() {
-                break 'centroids f.finish();
+            algorithm => {
+                if num_lists > 1 {
+                    pgrx::info!(
+                        "clustering: starting, clustering {num_points} vectors of {num_dim} dimension into {num_lists} clusters, in {num_iterations} iterations"
+                    );
+                }
+                let view = input.as_mut_view();
+                let spherical = internal_build.spherical_centroids;
+                let (mut model, name) = if is_leaf
+                    && matches!(algorithm, KMeansAlgorithm::Hierarchical {})
+                {
+                    (
+                        k_means::hierarchical_k_means(
+                            &pool, num_dim, view, num_lists, [7; 32], spherical,
+                        ),
+                        "hierarchical",
+                    )
+                } else {
+                    (
+                        k_means::lloyd_k_means(&pool, num_dim, view, num_lists, [7; 32], spherical),
+                        "lloyd",
+                    )
+                };
+                for i in 0..num_iterations {
+                    pgrx::check_for_interrupts!();
+                    report_progress(i, num_iterations);
+                    if num_lists > 1 {
+                        pgrx::info!("clustering: iteration {}", i + 1);
+                    }
+                    model.assign();
+                    model.update();
+                }
+                (Trained::Iterative(model), name)
             }
-            if let Some(sample_dim) = reduction {
+        };
+        let centroids = {
+            if let Some(sample_dim) = reduction.filter(|_| is_leaf) {
                 let mut sample = sampler.sample();
-                let index = f.index();
-                let index = &index;
+                let lookup: Box<dyn Fn(&[f32]) -> usize + Sync + '_> = match &trained {
+                    Trained::Iterative(model) => {
+                        let index = model.index();
+                        Box::new(move |sample| index(sample).1)
+                    }
+                    Trained::EMeans(centroids) => {
+                        Box::new(|sample| k_means_lookup(sample, centroids))
+                    }
+                };
+                let lookup = &lookup;
                 let is_spherical = internal_build.spherical_centroids;
                 let num_threads = {
                     let config = internal_build.build_threads as f64;
@@ -1456,7 +1482,7 @@ fn make_internal_build(
                             while let Ok(sample) = rx.recv() {
                                 let mut x = rabitq::rotate::rotate(&sample);
                                 x.truncate(sample_dim);
-                                let (_, id) = index(&x);
+                                let id = lookup(&x);
                                 f32::vector_add_inplace(&mut sum[id], &sample);
                                 count[id] += 1.0;
                             }
@@ -1546,18 +1572,21 @@ fn make_internal_build(
                     centroids
                 })
             } else {
-                f.finish()
+                match trained {
+                    Trained::Iterative(model) => model.finish(),
+                    Trained::EMeans(centroids) => centroids,
+                }
             }
         };
 
-        if result.is_empty() {
-            let percentage = 100;
-            let default = BuildPhase::from_code(BuildPhaseCode::InternalBuild);
-            let phase =
-                BuildPhase::new(BuildPhaseCode::InternalBuild, 1 + percentage).unwrap_or(default);
-            reporter.phase(phase);
-        }
+        report_progress(1, 1);
         if num_lists > 1 {
+            if is_leaf {
+                pgrx::info!(
+                    "clustering: trained {num_points} vectors into {num_lists} clusters with {algorithm_name} in {:.6} s",
+                    began.elapsed().as_secs_f64()
+                );
+            }
             pgrx::info!("clustering: finished");
         }
         if let Some(structure) = result.last() {
